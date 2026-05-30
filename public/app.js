@@ -1,7 +1,9 @@
 const form = document.querySelector("#uploadForm");
 const input = document.querySelector("#photos");
+const selectedPhotos = document.querySelector("#selectedPhotos");
 const statusText = document.querySelector("#status");
 const links = document.querySelector("#links");
+let selectedUrls = [];
 
 function setStatus(text, kind = "") {
   statusText.textContent = text;
@@ -35,6 +37,53 @@ function addLink(photo) {
   links.prepend(row);
 }
 
+function clearSelectedPreviews() {
+  selectedUrls.forEach((url) => URL.revokeObjectURL(url));
+  selectedUrls = [];
+  selectedPhotos.replaceChildren();
+  selectedPhotos.hidden = true;
+}
+
+function renderSelectedPreviews(files) {
+  clearSelectedPreviews();
+
+  if (!files.length) return;
+
+  const title = document.createElement("p");
+  title.className = "selected-title";
+  title.textContent = `Выбрано фото: ${files.length}`;
+  selectedPhotos.append(title);
+
+  const grid = document.createElement("div");
+  grid.className = "selected-grid";
+
+  for (const file of files) {
+    const card = document.createElement("article");
+    card.className = "selected-card";
+
+    const previewUrl = URL.createObjectURL(file);
+    selectedUrls.push(previewUrl);
+
+    const img = document.createElement("img");
+    img.src = previewUrl;
+    img.alt = file.name;
+
+    const name = document.createElement("span");
+    name.textContent = file.name;
+
+    card.append(img, name);
+    grid.append(card);
+  }
+
+  selectedPhotos.append(grid);
+  selectedPhotos.hidden = false;
+  setStatus("Фото выбраны. Нажми «Загрузить», и ссылки появятся снизу.");
+}
+
+input.addEventListener("change", () => {
+  renderSelectedPreviews([...input.files]);
+});
+
 form.addEventListener("submit", async (event) => {
   event.preventDefault();
 
@@ -58,8 +107,9 @@ form.addEventListener("submit", async (event) => {
 
     if (!response.ok) throw new Error(result.error || "Ошибка загрузки.");
     result.photos.forEach(addLink);
-    setStatus(`Готово: ссылок создано ${result.photos.length}.`, "success");
+    setStatus(`Готово: ссылок создано ${result.photos.length}. Можно добавить ещё фото.`, "success");
     input.value = "";
+    clearSelectedPreviews();
   } catch (error) {
     setStatus(error.message, "error");
   } finally {
