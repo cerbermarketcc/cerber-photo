@@ -126,6 +126,47 @@ h1 {
   color: #b03830;
 }
 
+.selected-photos {
+  display: grid;
+  gap: 12px;
+}
+
+.selected-title {
+  margin: 0;
+  color: #18565d;
+  font-weight: 800;
+}
+
+.selected-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(132px, 1fr));
+  gap: 10px;
+}
+
+.selected-card {
+  display: grid;
+  gap: 8px;
+  padding: 8px;
+  border: 1px solid rgba(23, 23, 23, 0.12);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.72);
+}
+
+.selected-card img {
+  width: 100%;
+  aspect-ratio: 1 / 1;
+  object-fit: cover;
+  border-radius: 6px;
+}
+
+.selected-card span {
+  overflow: hidden;
+  color: #51504c;
+  font-size: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .links {
   display: grid;
   gap: 10px;
