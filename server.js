@@ -268,7 +268,7 @@ async function handlePhotoPage(req, res, id) {
 </head>
 <body class="viewer">
   <main class="photo-view">
-    <a class="back-link" href="/">Загрузить ещё</a>
+    <a class="back-link" href="/">Загрузить анонимно</a>
     <img src="${imageUrl}" alt="Загруженное фото">
   </main>
 </body>
