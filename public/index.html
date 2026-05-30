@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Cerber Anonim Photo</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <main class="shell">
+    <section class="upload-panel">
+      <div>
+        <p class="eyebrow">Cerber Anonim Photo</p>
+        <h1>Загрузи фото и получи ссылку</h1>
+      </div>
+
+      <form id="uploadForm" class="dropzone">
+        <input id="photos" name="photos" type="file" accept="image/*" multiple>
+        <label for="photos">
+          <span class="plus">+</span>
+          <strong>Выбрать фото</strong>
+          <small>Можно загрузить несколько сразу</small>
+        </label>
+        <button type="submit">Загрузить</button>
+      </form>
+
+      <p id="status" class="status" aria-live="polite"></p>
+      <div id="links" class="links"></div>
+    </section>
+  </main>
+
+  <script src="/app.js" type="module"></script>
+</body>
+</html>
