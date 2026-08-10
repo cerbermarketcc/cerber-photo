@@ -10,6 +10,9 @@ const uploadDir = process.env.UPLOAD_DIR || path.join(__dirname, "uploads");
 const dbPath = path.join(uploadDir, "photos.json");
 const port = Number(process.env.PORT || 3000);
 const maxUploadBytes = Number(process.env.MAX_UPLOAD_BYTES || 25 * 1024 * 1024);
+const maxFilesPerUpload = Number(process.env.MAX_FILES_PER_UPLOAD || 20);
+const maxFileBytes = Number(process.env.MAX_FILE_BYTES || 10 * 1024 * 1024);
+let dbWriteQueue = Promise.resolve();
 
 const mimeByExt = {
   ".html": "text/html; charset=utf-8",
@@ -33,8 +36,20 @@ const allowedTypes = new Set([
 
 await fs.mkdir(uploadDir, { recursive: true });
 
+function securityHeaders(extra = {}) {
+  return {
+    "content-security-policy": "default-src 'self'; img-src 'self' blob: data:; script-src 'self'; style-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
+    "x-content-type-options": "nosniff",
+    "referrer-policy": "no-referrer",
+    "x-robots-tag": "noindex, nofollow",
+    "cross-origin-opener-policy": "same-origin",
+    "permissions-policy": "camera=(), microphone=(), geolocation=()",
+    ...extra
+  };
+}
+
 function send(res, status, body, headers = {}) {
-  res.writeHead(status, headers);
+  res.writeHead(status, securityHeaders(headers));
   res.end(body);
 }
 
@@ -62,7 +77,19 @@ async function readDb() {
 }
 
 async function writeDb(db) {
-  await fs.writeFile(dbPath, JSON.stringify(db, null, 2), "utf8");
+  const tmpPath = `${dbPath}.${crypto.randomBytes(6).toString("hex")}.tmp`;
+  await fs.writeFile(tmpPath, JSON.stringify(db, null, 2), "utf8");
+  await fs.rename(tmpPath, dbPath);
+}
+
+async function updateDb(mutator) {
+  dbWriteQueue = dbWriteQueue.then(async () => {
+    const db = await readDb();
+    const result = await mutator(db);
+    await writeDb(db);
+    return result;
+  });
+  return dbWriteQueue;
 }
 
 function getBaseUrl(req) {
@@ -160,6 +187,35 @@ function extensionFor(type, filename) {
   }[type] || "";
 }
 
+function isValidImageSignature(type, content) {
+  if (type === "image/jpeg") {
+    return content.length > 3 && content[0] === 0xff && content[1] === 0xd8 && content[2] === 0xff;
+  }
+
+  if (type === "image/png") {
+    return content.length > 8 && content.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
+  }
+
+  if (type === "image/gif") {
+    const signature = content.subarray(0, 6).toString("ascii");
+    return signature === "GIF87a" || signature === "GIF89a";
+  }
+
+  if (type === "image/webp") {
+    return content.length > 12 &&
+      content.subarray(0, 4).toString("ascii") === "RIFF" &&
+      content.subarray(8, 12).toString("ascii") === "WEBP";
+  }
+
+  if (type === "image/avif") {
+    return content.length > 12 &&
+      content.subarray(4, 8).toString("ascii") === "ftyp" &&
+      ["avif", "avis"].includes(content.subarray(8, 12).toString("ascii"));
+  }
+
+  return false;
+}
+
 async function servePublic(req, res) {
   const url = new URL(req.url, "http://localhost");
   const requested = url.pathname === "/" ? "/index.html" : safeDecode(url.pathname);
@@ -196,25 +252,31 @@ async function handleUpload(req, res) {
       return;
     }
 
-    const db = await readDb();
+    if (files.length > maxFilesPerUpload) {
+      sendJson(res, 400, { error: `За один раз можно загрузить максимум ${maxFilesPerUpload} фото.` });
+      return;
+    }
+
     const created = [];
+    const records = [];
 
     for (const file of files) {
       if (!allowedTypes.has(file.contentType)) continue;
+      if (file.content.length > maxFileBytes) continue;
+      if (!isValidImageSignature(file.contentType, file.content)) continue;
 
       const id = crypto.randomBytes(12).toString("hex");
       const ext = extensionFor(file.contentType, file.filename);
       const storedName = `${id}${ext}`;
       await fs.writeFile(path.join(uploadDir, storedName), file.content);
 
-      db[id] = {
+      records.push({
         id,
-        originalName: file.filename,
         storedName,
         contentType: file.contentType,
         size: file.content.length,
         createdAt: new Date().toISOString()
-      };
+      });
 
       created.push({
         id,
@@ -223,7 +285,15 @@ async function handleUpload(req, res) {
       });
     }
 
-    await writeDb(db);
+    if (!created.length) {
+      sendJson(res, 400, { error: "Поддерживаются только настоящие JPG, PNG, GIF, WEBP или AVIF фото до 10 MB." });
+      return;
+    }
+
+    await updateDb((db) => {
+      for (const record of records) db[record.id] = record;
+    });
+
     sendJson(res, 201, { photos: created });
   } catch (error) {
     sendJson(res, 400, { error: error.message || "Не удалось загрузить фото." });
@@ -242,6 +312,7 @@ async function handleImage(req, res, id) {
     const content = await fs.readFile(path.join(uploadDir, photo.storedName));
     send(res, 200, content, {
       "content-type": photo.contentType,
+      "content-disposition": "inline",
       "cache-control": "public, max-age=31536000, immutable"
     });
   } catch {

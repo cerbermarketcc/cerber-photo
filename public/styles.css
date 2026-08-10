@@ -74,6 +74,13 @@ h1 {
   border-radius: 8px;
   background: rgba(255, 255, 255, 0.62);
   cursor: pointer;
+  transition: border-color 160ms ease, background 160ms ease, transform 160ms ease;
+}
+
+.dropzone label.is-dragging {
+  border-color: #b03830;
+  background: rgba(255, 255, 255, 0.9);
+  transform: translateY(-2px);
 }
 
 .plus {
@@ -131,10 +138,33 @@ h1 {
   gap: 12px;
 }
 
+.selected-header {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  justify-content: space-between;
+}
+
 .selected-title {
   margin: 0;
   color: #18565d;
   font-weight: 800;
+}
+
+.ghost-button,
+.remove-button,
+.copy-all {
+  border: 1px solid rgba(23, 23, 23, 0.16);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.72);
+  color: #171717;
+  cursor: pointer;
+  font-weight: 800;
+}
+
+.ghost-button {
+  min-height: 40px;
+  padding: 0 14px;
 }
 
 .selected-grid {
@@ -159,12 +189,31 @@ h1 {
   border-radius: 6px;
 }
 
-.selected-card span {
+.selected-meta {
+  display: grid;
+  gap: 6px;
+}
+
+.selected-meta span {
   overflow: hidden;
   color: #51504c;
   font-size: 13px;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.selected-meta small {
+  color: #62615d;
+}
+
+.remove-button {
+  min-height: 36px;
+}
+
+.copy-all {
+  justify-self: start;
+  min-height: 44px;
+  padding: 0 16px;
 }
 
 .links {
