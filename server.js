@@ -558,12 +558,22 @@ function handlePhotoPage(req, res, id) {
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Cerber Anonim Photo</title>
+  <meta name="theme-color" content="#070708">
+  <title>CERBER PHOTO</title>
   <link rel="stylesheet" href="/styles.css">
 </head>
 <body class="viewer" data-photo-id="${id}">
+  <header class="viewer-bar">
+    <a class="brand" href="/" aria-label="CERBER PHOTO">
+      <img src="/assets/cerber-header-logo.png" alt="">
+      <span>
+        <strong>CERBER</strong>
+        <small>PRIVATE PHOTO</small>
+      </span>
+    </a>
+    <a class="back-link" href="/">Загрузить фото</a>
+  </header>
   <main class="photo-view">
-    <a class="back-link" href="/">Загрузить анонимно</a>
     <p id="viewerStatus" class="viewer-status">Проверка приватной ссылки...</p>
     <img id="privatePhoto" alt="Приватное фото" hidden>
   </main>

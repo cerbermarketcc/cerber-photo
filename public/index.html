@@ -3,25 +3,39 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Cerber Anonim Photo</title>
+  <meta name="theme-color" content="#070708">
+  <title>CERBER PHOTO</title>
   <link rel="stylesheet" href="/styles.css">
 </head>
 <body>
+  <header class="topbar">
+    <a class="brand" href="/" aria-label="CERBER PHOTO">
+      <img src="/assets/cerber-header-logo.png" alt="">
+      <span>
+        <strong>CERBER</strong>
+        <small>PRIVATE PHOTO</small>
+      </span>
+    </a>
+    <span class="privacy-badge"><i aria-hidden="true"></i> PRIVATE</span>
+  </header>
+
   <main class="shell">
     <section class="upload-panel">
-      <div>
-        <p class="eyebrow">Cerber Anonim Photo</p>
-        <h1>Загрузи фото и получи ссылку</h1>
+      <div class="page-heading">
+        <p class="eyebrow">CERBER PHOTO</p>
+        <h1>Приватная загрузка</h1>
+        <p class="heading-note">Фото доступно только по созданной ссылке.</p>
       </div>
 
       <form id="uploadForm" class="dropzone">
         <input id="photos" name="photos" type="file" accept="image/jpeg,image/png,image/gif,image/webp,image/avif" multiple>
         <label for="photos">
-          <span class="plus">+</span>
-          <strong>Выбрать фото</strong>
-          <small>Можно выбрать или перетащить несколько сразу</small>
+          <span class="upload-icon" aria-hidden="true"><span></span></span>
+          <strong>Выберите фото</strong>
+          <small>или перетащите сюда</small>
+          <span class="file-limits">JPG · PNG · GIF · WEBP · AVIF</span>
         </label>
-        <button type="submit">Загрузить</button>
+        <button type="submit">Создать приватные ссылки</button>
       </form>
 
       <p id="status" class="status" aria-live="polite"></p>
@@ -29,6 +43,8 @@
       <div id="links" class="links"></div>
     </section>
   </main>
+
+  <footer class="footer">CERBER SECURITY SYSTEM</footer>
 
   <script src="/app.js" type="module"></script>
 </body>
