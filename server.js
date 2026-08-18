@@ -8,10 +8,20 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const publicDir = path.join(__dirname, "public");
 const uploadDir = process.env.UPLOAD_DIR || path.join(__dirname, "uploads");
 const dbPath = path.join(uploadDir, "photos.json");
+const legacyKeysPath = path.join(uploadDir, ".legacy-photo-keys.json");
+const sessionSecretPath = path.join(uploadDir, ".photo-session-secret");
 const port = Number(process.env.PORT || 3000);
-const maxUploadBytes = Number(process.env.MAX_UPLOAD_BYTES || 25 * 1024 * 1024);
-const maxFilesPerUpload = Number(process.env.MAX_FILES_PER_UPLOAD || 20);
-const maxFileBytes = Number(process.env.MAX_FILE_BYTES || 10 * 1024 * 1024);
+const isProduction = process.env.NODE_ENV === "production" || Boolean(process.env.RENDER);
+const maxUploadBytes = positiveNumber(process.env.MAX_UPLOAD_BYTES, 25 * 1024 * 1024);
+const maxFilesPerUpload = positiveNumber(process.env.MAX_FILES_PER_UPLOAD, 20);
+const maxFileBytes = positiveNumber(process.env.MAX_FILE_BYTES, 10 * 1024 * 1024);
+const uploadRateLimit = positiveNumber(process.env.UPLOAD_RATE_LIMIT, 10);
+const uploadRateWindowMs = positiveNumber(process.env.UPLOAD_RATE_WINDOW_MS, 10 * 60 * 1000);
+const accessRateLimit = positiveNumber(process.env.ACCESS_RATE_LIMIT, 30);
+const accessRateWindowMs = positiveNumber(process.env.ACCESS_RATE_WINDOW_MS, 60 * 1000);
+const photoSessionTtlSeconds = positiveNumber(process.env.PHOTO_SESSION_TTL_SECONDS, 60 * 60);
+const maxStorageBytes = positiveNumber(process.env.MAX_STORAGE_BYTES, 2 * 1024 * 1024 * 1024);
+const rateBuckets = new Map();
 let dbWriteQueue = Promise.resolve();
 
 const mimeByExt = {
@@ -26,37 +36,67 @@ const mimeByExt = {
   ".avif": "image/avif"
 };
 
-const allowedTypes = new Set([
-  "image/jpeg",
-  "image/png",
-  "image/gif",
-  "image/webp",
-  "image/avif"
-]);
+const extensionByMime = {
+  "image/jpeg": ".jpg",
+  "image/png": ".png",
+  "image/gif": ".gif",
+  "image/webp": ".webp",
+  "image/avif": ".avif"
+};
 
-await fs.mkdir(uploadDir, { recursive: true });
+await fs.mkdir(uploadDir, { recursive: true, mode: 0o700 });
+const sessionSecret = await loadOrCreateSessionSecret();
+await migrateLegacyPhotos();
+
+function positiveNumber(value, fallback) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+async function loadOrCreateSessionSecret() {
+  const configured = String(process.env.PHOTO_SESSION_SECRET || "").trim();
+  if (configured) {
+    if (configured.length < 32) throw new Error("PHOTO_SESSION_SECRET must contain at least 32 characters");
+    return configured;
+  }
+
+  try {
+    const stored = (await fs.readFile(sessionSecretPath, "utf8")).trim();
+    if (stored.length >= 32) return stored;
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+  }
+
+  const generated = crypto.randomBytes(48).toString("base64url");
+  await fs.writeFile(sessionSecretPath, generated, { encoding: "utf8", mode: 0o600, flag: "wx" });
+  return generated;
+}
 
 function securityHeaders(extra = {}) {
   return {
-    "content-security-policy": "default-src 'self'; img-src 'self' blob: data:; script-src 'self'; style-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
+    "content-security-policy": "default-src 'self'; img-src 'self' blob: data:; script-src 'self'; style-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'",
     "x-content-type-options": "nosniff",
     "referrer-policy": "no-referrer",
-    "x-robots-tag": "noindex, nofollow",
+    "x-robots-tag": "noindex, nofollow, noarchive, noimageindex",
+    "x-frame-options": "DENY",
     "cross-origin-opener-policy": "same-origin",
-    "permissions-policy": "camera=(), microphone=(), geolocation=()",
+    "cross-origin-resource-policy": "same-origin",
+    "permissions-policy": "camera=(), microphone=(), geolocation=(), payment=(), usb=()",
+    ...(isProduction ? { "strict-transport-security": "max-age=31536000" } : {}),
     ...extra
   };
 }
 
-function send(res, status, body, headers = {}) {
+function send(res, status, body = "", headers = {}, method = "GET") {
   res.writeHead(status, securityHeaders(headers));
-  res.end(body);
+  res.end(method === "HEAD" ? undefined : body);
 }
 
-function sendJson(res, status, body) {
+function sendJson(res, status, body, method = "GET") {
   send(res, status, JSON.stringify(body), {
-    "content-type": "application/json; charset=utf-8"
-  });
+    "content-type": "application/json; charset=utf-8",
+    "cache-control": "no-store"
+  }, method);
 }
 
 function safeDecode(value) {
@@ -70,51 +110,137 @@ function safeDecode(value) {
 async function readDb() {
   try {
     const raw = await fs.readFile(dbPath, "utf8");
-    return JSON.parse(raw);
-  } catch {
-    return {};
+    const parsed = JSON.parse(raw);
+    if (!parsed || Array.isArray(parsed) || typeof parsed !== "object") throw new Error("Invalid photo database");
+    return parsed;
+  } catch (error) {
+    if (error.code === "ENOENT") return {};
+    throw error;
   }
 }
 
+async function writePrivateJson(filePath, value) {
+  const tmpPath = `${filePath}.${crypto.randomBytes(6).toString("hex")}.tmp`;
+  await fs.writeFile(tmpPath, JSON.stringify(value, null, 2), { encoding: "utf8", mode: 0o600 });
+  await fs.rename(tmpPath, filePath);
+}
+
 async function writeDb(db) {
-  const tmpPath = `${dbPath}.${crypto.randomBytes(6).toString("hex")}.tmp`;
-  await fs.writeFile(tmpPath, JSON.stringify(db, null, 2), "utf8");
-  await fs.rename(tmpPath, dbPath);
+  await writePrivateJson(dbPath, db);
 }
 
 async function updateDb(mutator) {
-  dbWriteQueue = dbWriteQueue.then(async () => {
+  const nextWrite = dbWriteQueue.catch(() => {}).then(async () => {
     const db = await readDb();
     const result = await mutator(db);
     await writeDb(db);
     return result;
   });
-  return dbWriteQueue;
+  dbWriteQueue = nextWrite;
+  return nextWrite;
 }
 
-function getBaseUrl(req) {
-  const proto = req.headers["x-forwarded-proto"] || "http";
-  const host = req.headers["x-forwarded-host"] || req.headers.host;
-  return `${proto}://${host}`;
+function createAccessToken() {
+  return crypto.randomBytes(32).toString("base64url");
+}
+
+function hashAccessToken(token) {
+  return crypto.createHash("sha256").update(String(token || "")).digest("base64url");
+}
+
+function secretValuesMatch(left, right) {
+  const a = Buffer.from(String(left || ""));
+  const b = Buffer.from(String(right || ""));
+  return a.length === b.length && a.length > 0 && crypto.timingSafeEqual(a, b);
+}
+
+async function migrateLegacyPhotos() {
+  const db = await readDb();
+  const legacyKeys = {};
+  let migrated = 0;
+
+  for (const [id, photo] of Object.entries(db)) {
+    if (!photo || typeof photo !== "object" || photo.accessHash) continue;
+    const accessToken = createAccessToken();
+    photo.accessHash = hashAccessToken(accessToken);
+    legacyKeys[id] = accessToken;
+    migrated += 1;
+  }
+
+  if (!migrated) return;
+
+  let existingRecovery = {};
+  try {
+    existingRecovery = JSON.parse(await fs.readFile(legacyKeysPath, "utf8"));
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+  }
+
+  await writePrivateJson(dbPath, db);
+  await writePrivateJson(legacyKeysPath, { ...existingRecovery, ...legacyKeys });
+  console.warn(`[privacy] revoked ${migrated} legacy public photo link(s); recovery keys stored outside the public directory`);
 }
 
 function collectBody(req) {
   return new Promise((resolve, reject) => {
     const chunks = [];
     let total = 0;
+    let settled = false;
 
     req.on("data", (chunk) => {
+      if (settled) return;
       total += chunk.length;
       if (total > maxUploadBytes) {
-        reject(new Error("Файл слишком большой."));
-        req.destroy();
+        settled = true;
+        const error = new Error("Загрузка слишком большая.");
+        error.status = 413;
+        reject(error);
         return;
       }
       chunks.push(chunk);
     });
 
-    req.on("end", () => resolve(Buffer.concat(chunks)));
-    req.on("error", reject);
+    req.on("end", () => {
+      if (!settled) resolve(Buffer.concat(chunks));
+    });
+    req.on("error", (error) => {
+      if (!settled) reject(error);
+    });
+  });
+}
+
+function collectJson(req, maxBytes = 4096) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let total = 0;
+    let settled = false;
+
+    req.on("data", (chunk) => {
+      if (settled) return;
+      total += chunk.length;
+      if (total > maxBytes) {
+        settled = true;
+        const error = new Error("Invalid request");
+        error.status = 413;
+        reject(error);
+        return;
+      }
+      chunks.push(chunk);
+    });
+
+    req.on("end", () => {
+      if (settled) return;
+      try {
+        resolve(JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}"));
+      } catch {
+        const error = new Error("Invalid JSON");
+        error.status = 400;
+        reject(error);
+      }
+    });
+    req.on("error", (error) => {
+      if (!settled) reject(error);
+    });
   });
 }
 
@@ -123,13 +249,13 @@ function parseContentDisposition(value = "") {
   for (const part of value.split(";")) {
     const [rawKey, ...rawVal] = part.trim().split("=");
     if (!rawVal.length) continue;
-    result[rawKey] = rawVal.join("=").replace(/^"|"$/g, "");
+    result[rawKey.toLowerCase()] = rawVal.join("=").replace(/^"|"$/g, "");
   }
   return result;
 }
 
 function parseMultipart(buffer, contentType) {
-  const boundaryMatch = contentType.match(/boundary=(?:"([^"]+)"|([^;]+))/i);
+  const boundaryMatch = contentType.match(/boundary=(?:"([A-Za-z0-9'()+_,.\/:=? -]{1,70})"|([A-Za-z0-9'()+_,.\/:=?-]{1,70}))(?:;|$)/i);
   if (!boundaryMatch) throw new Error("Не найден multipart boundary.");
 
   const boundary = Buffer.from(`--${boundaryMatch[1] || boundaryMatch[2]}`);
@@ -145,27 +271,24 @@ function parseMultipart(buffer, contentType) {
 
     if (part.subarray(0, 2).toString() === "--") break;
     if (part.subarray(0, 2).toString() === "\r\n") part = part.subarray(2);
-    if (part.subarray(part.length - 2).toString() === "\r\n") {
-      part = part.subarray(0, part.length - 2);
-    }
+    if (part.subarray(part.length - 2).toString() === "\r\n") part = part.subarray(0, part.length - 2);
 
     const headerEnd = part.indexOf(Buffer.from("\r\n\r\n"));
-    if (headerEnd === -1) continue;
+    if (headerEnd === -1 || headerEnd > 8192) continue;
 
     const rawHeaders = part.subarray(0, headerEnd).toString("utf8");
-    const content = part.subarray(headerEnd + 4);
-    const headers = Object.fromEntries(
-      rawHeaders.split("\r\n").map((line) => {
-        const splitAt = line.indexOf(":");
-        return [line.slice(0, splitAt).toLowerCase(), line.slice(splitAt + 1).trim()];
-      })
-    );
+    const headers = {};
+    for (const line of rawHeaders.split("\r\n")) {
+      const splitAt = line.indexOf(":");
+      if (splitAt <= 0) continue;
+      headers[line.slice(0, splitAt).toLowerCase()] = line.slice(splitAt + 1).trim();
+    }
 
     const disposition = parseContentDisposition(headers["content-disposition"]);
+    const content = part.subarray(headerEnd + 4);
     if (disposition.filename && content.length) {
       parts.push({
-        filename: disposition.filename,
-        contentType: headers["content-type"] || "application/octet-stream",
+        contentType: String(headers["content-type"] || "").split(";", 1)[0].trim().toLowerCase(),
         content
       });
     }
@@ -174,63 +297,107 @@ function parseMultipart(buffer, contentType) {
   return parts;
 }
 
-function extensionFor(type, filename) {
-  const clean = path.extname(filename).toLowerCase();
-  if ([".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif"].includes(clean)) return clean;
-
-  return {
-    "image/jpeg": ".jpg",
-    "image/png": ".png",
-    "image/gif": ".gif",
-    "image/webp": ".webp",
-    "image/avif": ".avif"
-  }[type] || "";
+function detectImageType(content) {
+  if (content.length > 3 && content[0] === 0xff && content[1] === 0xd8 && content[2] === 0xff) return "image/jpeg";
+  if (content.length > 8 && content.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) return "image/png";
+  const gifSignature = content.subarray(0, 6).toString("ascii");
+  if (gifSignature === "GIF87a" || gifSignature === "GIF89a") return "image/gif";
+  if (content.length > 12 && content.subarray(0, 4).toString("ascii") === "RIFF" && content.subarray(8, 12).toString("ascii") === "WEBP") return "image/webp";
+  if (content.length > 12 && content.subarray(4, 8).toString("ascii") === "ftyp" && ["avif", "avis"].includes(content.subarray(8, 12).toString("ascii"))) return "image/avif";
+  return "";
 }
 
-function isValidImageSignature(type, content) {
-  if (type === "image/jpeg") {
-    return content.length > 3 && content[0] === 0xff && content[1] === 0xd8 && content[2] === 0xff;
+function clientIp(req) {
+  const cloudflareIp = String(req.headers["cf-connecting-ip"] || "").trim();
+  const forwardedIp = String(req.headers["x-forwarded-for"] || "").split(",", 1)[0].trim();
+  return cloudflareIp || forwardedIp || req.socket.remoteAddress || "unknown";
+}
+
+function consumeRateLimit(scope, req, limit, windowMs, suffix = "") {
+  const now = Date.now();
+  if (rateBuckets.size > 10_000) {
+    for (const [bucketKey, bucket] of rateBuckets) {
+      if (bucket.resetAt <= now) rateBuckets.delete(bucketKey);
+    }
+  }
+  const key = `${scope}:${clientIp(req)}:${suffix}`;
+  const current = rateBuckets.get(key);
+  if (!current || current.resetAt <= now) {
+    rateBuckets.set(key, { count: 1, resetAt: now + windowMs });
+    return { allowed: true, retryAfter: 0 };
   }
 
-  if (type === "image/png") {
-    return content.length > 8 && content.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
+  current.count += 1;
+  if (current.count <= limit) return { allowed: true, retryAfter: 0 };
+  return { allowed: false, retryAfter: Math.max(1, Math.ceil((current.resetAt - now) / 1000)) };
+}
+
+function rejectCrossSite(req, res) {
+  const fetchSite = String(req.headers["sec-fetch-site"] || "").toLowerCase();
+  if (fetchSite === "cross-site") {
+    sendJson(res, 403, { error: "Запрос отклонён." });
+    return true;
   }
 
-  if (type === "image/gif") {
-    const signature = content.subarray(0, 6).toString("ascii");
-    return signature === "GIF87a" || signature === "GIF89a";
-  }
+  const origin = String(req.headers.origin || "");
+  if (!origin) return false;
 
-  if (type === "image/webp") {
-    return content.length > 12 &&
-      content.subarray(0, 4).toString("ascii") === "RIFF" &&
-      content.subarray(8, 12).toString("ascii") === "WEBP";
-  }
+  try {
+    if (new URL(origin).host === String(req.headers.host || "")) return false;
+  } catch {}
 
-  if (type === "image/avif") {
-    return content.length > 12 &&
-      content.subarray(4, 8).toString("ascii") === "ftyp" &&
-      ["avif", "avis"].includes(content.subarray(8, 12).toString("ascii"));
-  }
+  sendJson(res, 403, { error: "Запрос отклонён." });
+  return true;
+}
 
-  return false;
+function parseCookies(req) {
+  const cookies = {};
+  for (const item of String(req.headers.cookie || "").split(";")) {
+    const splitAt = item.indexOf("=");
+    if (splitAt <= 0) continue;
+    cookies[item.slice(0, splitAt).trim()] = item.slice(splitAt + 1).trim();
+  }
+  return cookies;
+}
+
+function signPhotoSession(id) {
+  const payload = Buffer.from(JSON.stringify({
+    id,
+    exp: Date.now() + photoSessionTtlSeconds * 1000,
+    nonce: crypto.randomBytes(12).toString("base64url")
+  })).toString("base64url");
+  const signature = crypto.createHmac("sha256", sessionSecret).update(payload).digest("base64url");
+  return `${payload}.${signature}`;
+}
+
+function verifyPhotoSession(value, expectedId) {
+  const [payload, signature, extra] = String(value || "").split(".");
+  if (!payload || !signature || extra) return false;
+  const expectedSignature = crypto.createHmac("sha256", sessionSecret).update(payload).digest("base64url");
+  if (!secretValuesMatch(signature, expectedSignature)) return false;
+
+  try {
+    const parsed = JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
+    return parsed.id === expectedId && Number(parsed.exp) > Date.now();
+  } catch {
+    return false;
+  }
 }
 
 async function servePublic(req, res) {
   const url = new URL(req.url, "http://localhost");
   const requested = url.pathname === "/" ? "/index.html" : safeDecode(url.pathname);
-  const filePath = path.normalize(path.join(publicDir, requested));
+  const filePath = path.resolve(publicDir, `.${requested}`);
+  const relative = path.relative(publicDir, filePath);
 
-  if (!filePath.startsWith(publicDir)) {
-    send(res, 403, "Forbidden");
-    return true;
-  }
+  if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) return false;
 
   try {
     const content = await fs.readFile(filePath);
     send(res, 200, content, {
-      "content-type": mimeByExt[path.extname(filePath).toLowerCase()] || "application/octet-stream"
-    });
+      "content-type": mimeByExt[path.extname(filePath).toLowerCase()] || "application/octet-stream",
+      "cache-control": "no-cache"
+    }, req.method);
     return true;
   } catch {
     return false;
@@ -238,10 +405,21 @@ async function servePublic(req, res) {
 }
 
 async function handleUpload(req, res) {
+  const rate = consumeRateLimit("upload", req, uploadRateLimit, uploadRateWindowMs);
+  if (!rate.allowed) {
+    sendJson(res, 429, { error: "Слишком много загрузок. Попробуйте позже." });
+    return;
+  }
+
+  const storedPaths = [];
   try {
-    const contentType = req.headers["content-type"] || "";
-    if (!contentType.startsWith("multipart/form-data")) {
+    const contentType = String(req.headers["content-type"] || "");
+    if (!contentType.toLowerCase().startsWith("multipart/form-data")) {
       sendJson(res, 400, { error: "Нужно отправить фото через форму." });
+      return;
+    }
+    if (Number(req.headers["content-length"] || 0) > maxUploadBytes) {
+      sendJson(res, 413, { error: "Загрузка слишком большая." });
       return;
     }
 
@@ -260,28 +438,31 @@ async function handleUpload(req, res) {
     const created = [];
     const records = [];
 
-    for (const file of files) {
-      if (!allowedTypes.has(file.contentType)) continue;
+    for (const [uploadIndex, file] of files.entries()) {
       if (file.content.length > maxFileBytes) continue;
-      if (!isValidImageSignature(file.contentType, file.content)) continue;
+      const detectedType = detectImageType(file.content);
+      if (!detectedType || detectedType !== file.contentType) continue;
 
-      const id = crypto.randomBytes(12).toString("hex");
-      const ext = extensionFor(file.contentType, file.filename);
-      const storedName = `${id}${ext}`;
-      await fs.writeFile(path.join(uploadDir, storedName), file.content);
+      const id = crypto.randomBytes(16).toString("hex");
+      const accessToken = createAccessToken();
+      const storedName = `${id}${extensionByMime[detectedType]}`;
+      const storedPath = path.join(uploadDir, storedName);
+      await fs.writeFile(storedPath, file.content, { mode: 0o600, flag: "wx" });
+      storedPaths.push(storedPath);
 
       records.push({
         id,
         storedName,
-        contentType: file.contentType,
+        contentType: detectedType,
         size: file.content.length,
+        accessHash: hashAccessToken(accessToken),
         createdAt: new Date().toISOString()
       });
 
       created.push({
         id,
-        url: `${getBaseUrl(req)}/p/${id}`,
-        imageUrl: `${getBaseUrl(req)}/image/${id}`
+        uploadIndex,
+        url: `/p/${id}#key=${accessToken}`
       });
     }
 
@@ -291,44 +472,87 @@ async function handleUpload(req, res) {
     }
 
     await updateDb((db) => {
+      const usedBytes = Object.values(db).reduce((total, photo) => total + Math.max(0, Number(photo?.size || 0)), 0);
+      const incomingBytes = records.reduce((total, photo) => total + photo.size, 0);
+      if (usedBytes + incomingBytes > maxStorageBytes) {
+        const error = new Error("Хранилище заполнено.");
+        error.status = 507;
+        throw error;
+      }
       for (const record of records) db[record.id] = record;
     });
 
     sendJson(res, 201, { photos: created });
   } catch (error) {
-    sendJson(res, 400, { error: error.message || "Не удалось загрузить фото." });
+    await Promise.allSettled(storedPaths.map((storedPath) => fs.unlink(storedPath)));
+    const publicError = [413, 507].includes(error.status) ? error.message : "Не удалось загрузить фото.";
+    sendJson(res, error.status || 400, { error: publicError });
   }
 }
 
-async function handleImage(req, res, id) {
-  const db = await readDb();
-  const photo = db[id];
-  if (!photo) {
-    send(res, 404, "Фото не найдено");
+async function handlePhotoSession(req, res, id) {
+  const rate = consumeRateLimit("photo-access", req, accessRateLimit, accessRateWindowMs, id);
+  if (!rate.allowed) {
+    sendJson(res, 429, { error: "Слишком много попыток. Попробуйте позже." });
     return;
   }
 
   try {
+    const body = await collectJson(req);
+    const key = typeof body.key === "string" && /^[A-Za-z0-9_-]{43}$/.test(body.key) ? body.key : "";
+    const db = await readDb();
+    const photo = db[id];
+    if (!photo?.accessHash || !secretValuesMatch(hashAccessToken(key), photo.accessHash)) {
+      sendJson(res, 404, { error: "Фото недоступно." });
+      return;
+    }
+
+    const cookie = [
+      `cerber_photo_access=${signPhotoSession(id)}`,
+      "HttpOnly",
+      "SameSite=Strict",
+      "Path=/image/",
+      `Max-Age=${photoSessionTtlSeconds}`,
+      ...(isProduction ? ["Secure"] : [])
+    ].join("; ");
+
+    send(res, 204, "", {
+      "set-cookie": cookie,
+      "cache-control": "no-store"
+    }, req.method);
+  } catch (error) {
+    sendJson(res, error.status || 400, { error: "Неверный запрос." });
+  }
+}
+
+async function handleImage(req, res, id) {
+  const session = parseCookies(req).cerber_photo_access;
+  if (!verifyPhotoSession(session, id)) {
+    send(res, 404, "Фото недоступно", { "cache-control": "no-store" }, req.method);
+    return;
+  }
+
+  try {
+    const db = await readDb();
+    const photo = db[id];
+    if (!photo || !/^[a-f0-9]{24,32}\.(?:jpg|png|gif|webp|avif)$/.test(String(photo.storedName || ""))) {
+      send(res, 404, "Фото недоступно", { "cache-control": "no-store" }, req.method);
+      return;
+    }
+
     const content = await fs.readFile(path.join(uploadDir, photo.storedName));
     send(res, 200, content, {
       "content-type": photo.contentType,
       "content-disposition": "inline",
-      "cache-control": "public, max-age=31536000, immutable"
-    });
+      "cache-control": "private, no-store, max-age=0",
+      pragma: "no-cache"
+    }, req.method);
   } catch {
-    send(res, 404, "Файл не найден");
+    send(res, 404, "Фото недоступно", { "cache-control": "no-store" }, req.method);
   }
 }
 
-async function handlePhotoPage(req, res, id) {
-  const db = await readDb();
-  const photo = db[id];
-  if (!photo) {
-    send(res, 404, "<h1>Фото не найдено</h1>", { "content-type": "text/html; charset=utf-8" });
-    return;
-  }
-
-  const imageUrl = `/image/${id}`;
+function handlePhotoPage(req, res, id) {
   const html = `<!doctype html>
 <html lang="ru">
 <head>
@@ -337,39 +561,63 @@ async function handlePhotoPage(req, res, id) {
   <title>Cerber Anonim Photo</title>
   <link rel="stylesheet" href="/styles.css">
 </head>
-<body class="viewer">
+<body class="viewer" data-photo-id="${id}">
   <main class="photo-view">
     <a class="back-link" href="/">Загрузить анонимно</a>
-    <img src="${imageUrl}" alt="Загруженное фото">
+    <p id="viewerStatus" class="viewer-status">Проверка приватной ссылки...</p>
+    <img id="privatePhoto" alt="Приватное фото" hidden>
   </main>
+  <script src="/viewer.js" type="module"></script>
 </body>
 </html>`;
-  send(res, 200, html, { "content-type": "text/html; charset=utf-8" });
+  send(res, 200, html, {
+    "content-type": "text/html; charset=utf-8",
+    "cache-control": "no-store"
+  }, req.method);
 }
 
 const server = createServer(async (req, res) => {
-  const url = new URL(req.url, "http://localhost");
+  try {
+    const url = new URL(req.url, "http://localhost");
+    const method = String(req.method || "GET").toUpperCase();
 
-  if (req.method === "POST" && url.pathname === "/api/upload") {
-    await handleUpload(req, res);
-    return;
+    if (method === "POST" && url.pathname === "/api/upload") {
+      if (rejectCrossSite(req, res)) return;
+      await handleUpload(req, res);
+      return;
+    }
+
+    const sessionMatch = url.pathname.match(/^\/api\/photos\/([a-f0-9]{24}|[a-f0-9]{32})\/session$/);
+    if (method === "POST" && sessionMatch) {
+      if (rejectCrossSite(req, res)) return;
+      await handlePhotoSession(req, res, sessionMatch[1]);
+      return;
+    }
+
+    const imageMatch = url.pathname.match(/^\/image\/([a-f0-9]{24}|[a-f0-9]{32})$/);
+    if (["GET", "HEAD"].includes(method) && imageMatch) {
+      await handleImage(req, res, imageMatch[1]);
+      return;
+    }
+
+    const pageMatch = url.pathname.match(/^\/p\/([a-f0-9]{24}|[a-f0-9]{32})$/);
+    if (["GET", "HEAD"].includes(method) && pageMatch) {
+      handlePhotoPage(req, res, pageMatch[1]);
+      return;
+    }
+
+    if (["GET", "HEAD"].includes(method) && (await servePublic(req, res))) return;
+    send(res, 404, "Not found", { "cache-control": "no-store" }, method);
+  } catch {
+    send(res, 500, "Server error", { "cache-control": "no-store" }, req.method);
   }
-
-  if (req.method === "GET" && url.pathname.startsWith("/image/")) {
-    await handleImage(req, res, url.pathname.split("/").pop());
-    return;
-  }
-
-  if (req.method === "GET" && url.pathname.startsWith("/p/")) {
-    await handlePhotoPage(req, res, url.pathname.split("/").pop());
-    return;
-  }
-
-  if (req.method === "GET" && (await servePublic(req, res))) return;
-  send(res, 404, "Not found");
 });
 
+server.requestTimeout = 30_000;
+server.headersTimeout = 10_000;
+server.keepAliveTimeout = 5_000;
+server.maxHeadersCount = 100;
+
 server.listen(port, () => {
-  console.log(`Cerber Anonim Photo: http://localhost:${port}`);
-  console.log(`Uploads: ${uploadDir}`);
+  console.log(`Cerber Anonim Photo listening on port ${port}`);
 });

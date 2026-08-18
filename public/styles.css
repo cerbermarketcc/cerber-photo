@@ -273,6 +273,14 @@ h1 {
   object-fit: contain;
 }
 
+.viewer-status {
+  max-width: 520px;
+  margin: 0;
+  color: #fff;
+  font-size: 18px;
+  text-align: center;
+}
+
 .back-link {
   position: fixed;
   top: 16px;

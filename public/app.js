@@ -115,25 +115,30 @@ function setFiles(files) {
   renderSelectedPreviews();
 }
 
-function addLink(photo) {
-  createdLinks.unshift(photo.url);
+function addLink(photo, sourceFile) {
+  const shareUrl = new URL(photo.url, window.location.origin).href;
+  createdLinks.unshift(shareUrl);
 
   const row = document.createElement("article");
   row.className = "link-row";
 
   const preview = document.createElement("img");
-  preview.src = photo.imageUrl;
   preview.alt = "";
+  if (sourceFile) {
+    const previewUrl = URL.createObjectURL(sourceFile);
+    preview.src = previewUrl;
+    preview.addEventListener("load", () => URL.revokeObjectURL(previewUrl), { once: true });
+  }
 
   const url = document.createElement("input");
-  url.value = photo.url;
+  url.value = shareUrl;
   url.readOnly = true;
 
   const copy = document.createElement("button");
   copy.type = "button";
   copy.textContent = "Скопировать";
   copy.addEventListener("click", async () => {
-    await navigator.clipboard.writeText(photo.url);
+    await navigator.clipboard.writeText(shareUrl);
     copy.textContent = "Скопировано";
     setTimeout(() => {
       copy.textContent = "Скопировать";
@@ -212,7 +217,8 @@ form.addEventListener("submit", async (event) => {
     const result = await response.json();
 
     if (!response.ok) throw new Error(result.error || "Ошибка загрузки.");
-    result.photos.forEach(addLink);
+    const uploadedFiles = [...selectedFiles];
+    result.photos.forEach((photo) => addLink(photo, uploadedFiles[photo.uploadIndex]));
     renderCopyAllButton();
     setStatus(`Готово: ссылок создано ${result.photos.length}. Можно добавить ещё фото.`, "success");
     selectedFiles = [];
