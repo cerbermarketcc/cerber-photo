@@ -3,6 +3,13 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import crypto from "node:crypto";
+import {
+  DeleteObjectCommand,
+  GetObjectCommand,
+  HeadObjectCommand,
+  PutObjectCommand,
+  S3Client
+} from "@aws-sdk/client-s3";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const publicDir = path.join(__dirname, "public");
@@ -21,8 +28,28 @@ const accessRateLimit = positiveNumber(process.env.ACCESS_RATE_LIMIT, 30);
 const accessRateWindowMs = positiveNumber(process.env.ACCESS_RATE_WINDOW_MS, 60 * 1000);
 const photoSessionTtlSeconds = positiveNumber(process.env.PHOTO_SESSION_TTL_SECONDS, 60 * 60);
 const maxStorageBytes = positiveNumber(process.env.MAX_STORAGE_BYTES, 2 * 1024 * 1024 * 1024);
+const r2Bucket = String(process.env.R2_BUCKET || "").trim();
+const r2Endpoint = String(process.env.R2_ENDPOINT || "").trim().replace(/\/$/, "");
+const r2AccessKeyId = String(process.env.R2_ACCESS_KEY_ID || "").trim();
+const r2SecretAccessKey = String(process.env.R2_SECRET_ACCESS_KEY || "").trim();
+const r2Prefix = String(process.env.R2_PREFIX || "cerber-photo").trim().replace(/^\/+|\/+$/g, "");
 const rateBuckets = new Map();
 let dbWriteQueue = Promise.resolve();
+
+const r2Settings = [r2Bucket, r2Endpoint, r2AccessKeyId, r2SecretAccessKey];
+if (r2Settings.some(Boolean) && !r2Settings.every(Boolean)) {
+  throw new Error("R2 backup is incomplete. Set R2_BUCKET, R2_ENDPOINT, R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY");
+}
+
+const r2 = r2Settings.every(Boolean) ? new S3Client({
+  region: "auto",
+  endpoint: r2Endpoint,
+  forcePathStyle: process.env.R2_FORCE_PATH_STYLE === "true",
+  credentials: {
+    accessKeyId: r2AccessKeyId,
+    secretAccessKey: r2SecretAccessKey
+  }
+}) : null;
 
 const mimeByExt = {
   ".html": "text/html; charset=utf-8",
@@ -138,6 +165,151 @@ async function updateDb(mutator) {
   });
   dbWriteQueue = nextWrite;
   return nextWrite;
+}
+
+function r2Key(type, name) {
+  return [r2Prefix, type, name].filter(Boolean).join("/");
+}
+
+function validPhotoRecord(id, photo) {
+  return Boolean(
+    photo &&
+    typeof photo === "object" &&
+    photo.id === id &&
+    /^[a-f0-9]{24,32}$/.test(id) &&
+    new RegExp(`^${id}\\.(?:jpg|png|gif|webp|avif)$`).test(String(photo.storedName || "")) &&
+    Object.hasOwn(extensionByMime, String(photo.contentType || "")) &&
+    Number.isFinite(Number(photo.size)) &&
+    Number(photo.size) > 0 &&
+    /^[A-Za-z0-9_-]{43}$/.test(String(photo.accessHash || ""))
+  );
+}
+
+async function bodyToBuffer(body) {
+  if (!body) throw new Error("R2 returned an empty object");
+  if (typeof body.transformToByteArray === "function") {
+    return Buffer.from(await body.transformToByteArray());
+  }
+
+  const chunks = [];
+  for await (const chunk of body) chunks.push(Buffer.from(chunk));
+  return Buffer.concat(chunks);
+}
+
+async function deleteBackupRecord(record) {
+  if (!r2) return;
+  await Promise.allSettled([
+    r2.send(new DeleteObjectCommand({ Bucket: r2Bucket, Key: r2Key("photos", record.storedName) })),
+    r2.send(new DeleteObjectCommand({ Bucket: r2Bucket, Key: r2Key("records", `${record.id}.json`) }))
+  ]);
+}
+
+async function backupPhoto(record, content) {
+  if (!r2) return;
+  try {
+    await r2.send(new PutObjectCommand({
+      Bucket: r2Bucket,
+      Key: r2Key("photos", record.storedName),
+      Body: content,
+      ContentType: record.contentType,
+      CacheControl: "private, no-store"
+    }));
+    await r2.send(new PutObjectCommand({
+      Bucket: r2Bucket,
+      Key: r2Key("records", `${record.id}.json`),
+      Body: JSON.stringify(record),
+      ContentType: "application/json",
+      CacheControl: "no-store"
+    }));
+  } catch (error) {
+    await deleteBackupRecord(record);
+    throw error;
+  }
+}
+
+async function readBackupRecord(id) {
+  if (!r2) return null;
+  try {
+    const object = await r2.send(new GetObjectCommand({
+      Bucket: r2Bucket,
+      Key: r2Key("records", `${id}.json`)
+    }));
+    const record = JSON.parse((await bodyToBuffer(object.Body)).toString("utf8"));
+    return validPhotoRecord(id, record) ? record : null;
+  } catch (error) {
+    if (["NoSuchKey", "NotFound"].includes(error?.name) || error?.$metadata?.httpStatusCode === 404) return null;
+    throw error;
+  }
+}
+
+async function getPhotoRecord(id) {
+  const db = await readDb();
+  if (validPhotoRecord(id, db[id])) return db[id];
+
+  const restored = await readBackupRecord(id);
+  if (!restored) return null;
+  await updateDb((current) => {
+    current[id] = restored;
+  });
+  console.log(`[backup] restored photo record ${id} from R2`);
+  return restored;
+}
+
+async function readPhotoContent(photo) {
+  const localPath = path.join(uploadDir, photo.storedName);
+  try {
+    return await fs.readFile(localPath);
+  } catch (error) {
+    if (error.code !== "ENOENT" || !r2) throw error;
+  }
+
+  const object = await r2.send(new GetObjectCommand({
+    Bucket: r2Bucket,
+    Key: r2Key("photos", photo.storedName)
+  }));
+  const content = await bodyToBuffer(object.Body);
+  if (content.length !== Number(photo.size) || detectImageType(content) !== photo.contentType) {
+    throw new Error("Invalid photo backup");
+  }
+  await fs.writeFile(localPath, content, { mode: 0o600, flag: "wx" }).catch((error) => {
+    if (error.code !== "EEXIST") throw error;
+  });
+  console.log(`[backup] restored photo file ${photo.id} from R2`);
+  return content;
+}
+
+async function backupObjectExists(key) {
+  try {
+    await r2.send(new HeadObjectCommand({ Bucket: r2Bucket, Key: key }));
+    return true;
+  } catch (error) {
+    if (["NoSuchKey", "NotFound"].includes(error?.name) || error?.$metadata?.httpStatusCode === 404) return false;
+    throw error;
+  }
+}
+
+async function backupExistingPhotos() {
+  if (!r2) return;
+  const entries = Object.entries(await readDb()).filter(([id, photo]) => validPhotoRecord(id, photo));
+  let copied = 0;
+
+  for (let index = 0; index < entries.length; index += 3) {
+    const group = entries.slice(index, index + 3);
+    await Promise.all(group.map(async ([, photo]) => {
+      const photoKey = r2Key("photos", photo.storedName);
+      const recordKey = r2Key("records", `${photo.id}.json`);
+      const [hasPhoto, hasRecord] = await Promise.all([
+        backupObjectExists(photoKey),
+        backupObjectExists(recordKey)
+      ]);
+      if (hasPhoto && hasRecord) return;
+      const content = await fs.readFile(path.join(uploadDir, photo.storedName));
+      await backupPhoto(photo, content);
+      copied += 1;
+    }));
+  }
+
+  console.log(`[backup] R2 ready; ${entries.length} photo(s) checked, ${copied} copied`);
 }
 
 function createAccessToken() {
@@ -412,6 +584,7 @@ async function handleUpload(req, res) {
   }
 
   const storedPaths = [];
+  const backedUpRecords = [];
   try {
     const contentType = String(req.headers["content-type"] || "");
     if (!contentType.toLowerCase().startsWith("multipart/form-data")) {
@@ -459,6 +632,9 @@ async function handleUpload(req, res) {
         createdAt: new Date().toISOString()
       });
 
+      await backupPhoto(records.at(-1), file.content);
+      if (r2) backedUpRecords.push(records.at(-1));
+
       created.push({
         id,
         uploadIndex,
@@ -485,6 +661,8 @@ async function handleUpload(req, res) {
     sendJson(res, 201, { photos: created });
   } catch (error) {
     await Promise.allSettled(storedPaths.map((storedPath) => fs.unlink(storedPath)));
+    await Promise.allSettled(backedUpRecords.map((record) => deleteBackupRecord(record)));
+    console.error("[upload]", error);
     const publicError = [413, 507].includes(error.status) ? error.message : "Не удалось загрузить фото.";
     sendJson(res, error.status || 400, { error: publicError });
   }
@@ -500,8 +678,7 @@ async function handlePhotoSession(req, res, id) {
   try {
     const body = await collectJson(req);
     const key = typeof body.key === "string" && /^[A-Za-z0-9_-]{43}$/.test(body.key) ? body.key : "";
-    const db = await readDb();
-    const photo = db[id];
+    const photo = await getPhotoRecord(id);
     if (!photo?.accessHash || !secretValuesMatch(hashAccessToken(key), photo.accessHash)) {
       sendJson(res, 404, { error: "Фото недоступно." });
       return;
@@ -533,14 +710,13 @@ async function handleImage(req, res, id) {
   }
 
   try {
-    const db = await readDb();
-    const photo = db[id];
+    const photo = await getPhotoRecord(id);
     if (!photo || !/^[a-f0-9]{24,32}\.(?:jpg|png|gif|webp|avif)$/.test(String(photo.storedName || ""))) {
       send(res, 404, "Фото недоступно", { "cache-control": "no-store" }, req.method);
       return;
     }
 
-    const content = await fs.readFile(path.join(uploadDir, photo.storedName));
+    const content = await readPhotoContent(photo);
     send(res, 200, content, {
       "content-type": photo.contentType,
       "content-disposition": "inline",
@@ -630,4 +806,9 @@ server.maxHeadersCount = 100;
 
 server.listen(port, () => {
   console.log(`Cerber Anonim Photo listening on port ${port}`);
+  if (r2) {
+    backupExistingPhotos().catch((error) => console.error("[backup] initial R2 sync failed", error));
+  } else {
+    console.warn("[backup] R2 is not configured; photos only exist on the Render disk");
+  }
 });
