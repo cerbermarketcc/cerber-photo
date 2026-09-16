@@ -105,7 +105,8 @@ test("new uploads use a fragment secret and never expose the raw image", async (
   });
   assert.equal(session.status, 204);
   const cookie = cookieFrom(session);
-  assert.match(cookie, /^cerber_photo_access=/);
+  assert.ok(cookie.startsWith(`cerber_photo_access_${id}=`));
+  assert.ok(session.headers.get("set-cookie").includes(`Path=/image/${id};`));
   assert.match(session.headers.get("set-cookie"), /HttpOnly/i);
   assert.match(session.headers.get("set-cookie"), /SameSite=Strict/i);
 
@@ -118,6 +119,30 @@ test("new uploads use a fragment secret and never expose the raw image", async (
   const db = JSON.parse(await fs.readFile(path.join(uploadDir, "photos.json"), "utf8"));
   assert.notEqual(db[id].accessHash, key);
   assert.equal(JSON.stringify(db).includes(key), false);
+});
+
+test("two photo links have independent sessions and can be reopened by another visitor", async () => {
+  const photos = [];
+  for (let index = 0; index < 2; index++) {
+    const uploaded = await (await upload()).json();
+    const link = new URL(uploaded.photos[0].url, baseUrl);
+    const id = uploaded.photos[0].id;
+    const body = JSON.stringify({ key: new URLSearchParams(link.hash.slice(1)).get("key") });
+    const response = await fetch(`${baseUrl}/api/photos/${id}/session`, {
+      method: "POST", headers: { "content-type": "application/json" }, body
+    });
+    assert.equal(response.status, 204);
+    photos.push({ id, body, cookie: cookieFrom(response) });
+  }
+  const cookie = photos.map(photo => photo.cookie).join("; ");
+  for (const photo of photos) {
+    assert.equal((await fetch(`${baseUrl}/image/${photo.id}`, { headers: { cookie } })).status, 200);
+    const reopened = await fetch(`${baseUrl}/api/photos/${photo.id}/session`, {
+      method: "POST", headers: { "content-type": "application/json" }, body: photo.body
+    });
+    assert.equal(reopened.status, 204);
+    assert.equal((await fetch(`${baseUrl}/image/${photo.id}`, { headers: { cookie: cookieFrom(reopened) } })).status, 200);
+  }
 });
 
 test("legacy public links are revoked without deleting their files", async () => {

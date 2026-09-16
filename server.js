@@ -685,10 +685,10 @@ async function handlePhotoSession(req, res, id) {
     }
 
     const cookie = [
-      `cerber_photo_access=${signPhotoSession(id)}`,
+      `cerber_photo_access_${id}=${signPhotoSession(id)}`,
       "HttpOnly",
       "SameSite=Strict",
-      "Path=/image/",
+      `Path=/image/${id}`,
       `Max-Age=${photoSessionTtlSeconds}`,
       ...(isProduction ? ["Secure"] : [])
     ].join("; ");
@@ -698,13 +698,16 @@ async function handlePhotoSession(req, res, id) {
       "cache-control": "no-store"
     }, req.method);
   } catch (error) {
-    sendJson(res, error.status || 400, { error: "Неверный запрос." });
+    if (error.status) return sendJson(res, error.status, { error: "Неверный запрос." });
+    console.error("[photo-session] storage failure", { name: error.name, code: error.code });
+    sendJson(res, 503, { error: "Хранилище временно недоступно. Попробуйте позже." });
   }
 }
 
 async function handleImage(req, res, id) {
-  const session = parseCookies(req).cerber_photo_access;
-  if (!verifyPhotoSession(session, id)) {
+  const cookies = parseCookies(req);
+  const session = cookies[`cerber_photo_access_${id}`];
+  if (!verifyPhotoSession(session, id) && !verifyPhotoSession(cookies.cerber_photo_access, id)) {
     send(res, 404, "Фото недоступно", { "cache-control": "no-store" }, req.method);
     return;
   }
@@ -723,8 +726,9 @@ async function handleImage(req, res, id) {
       "cache-control": "private, no-store, max-age=0",
       pragma: "no-cache"
     }, req.method);
-  } catch {
-    send(res, 404, "Фото недоступно", { "cache-control": "no-store" }, req.method);
+  } catch (error) {
+    const missing = error.code === "ENOENT" || ["NoSuchKey", "NotFound"].includes(error.name) || error?.$metadata?.httpStatusCode === 404;
+    send(res, missing ? 404 : 503, missing ? "Фото недоступно" : "Хранилище временно недоступно", { "cache-control": "no-store" }, req.method);
   }
 }
 
