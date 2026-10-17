@@ -33,8 +33,15 @@ const r2Endpoint = String(process.env.R2_ENDPOINT || "").trim().replace(/\/$/, "
 const r2AccessKeyId = String(process.env.R2_ACCESS_KEY_ID || "").trim();
 const r2SecretAccessKey = String(process.env.R2_SECRET_ACCESS_KEY || "").trim();
 const r2Prefix = String(process.env.R2_PREFIX || "cerber-photo").trim().replace(/^\/+|\/+$/g, "");
+const r2RetryMs = positiveNumber(process.env.R2_RETRY_MS, 60 * 1000);
+const appBuild = String(process.env.RENDER_GIT_COMMIT || process.env.APP_BUILD || "local").trim().slice(0, 40) || "local";
 const rateBuckets = new Map();
 let dbWriteQueue = Promise.resolve();
+const pendingBackups = new Map();
+let backupWorker = null;
+let backupRetryTimer = null;
+let backupLastErrorAt = null;
+let backupLastSuccessAt = null;
 
 const r2Settings = [r2Bucket, r2Endpoint, r2AccessKeyId, r2SecretAccessKey];
 if (r2Settings.some(Boolean) && !r2Settings.every(Boolean)) {
@@ -227,6 +234,64 @@ async function backupPhoto(record, content) {
   }
 }
 
+function currentBackupStatus() {
+  if (!r2) {
+    return { configured: false, status: "disabled", pending: 0 };
+  }
+
+  const pending = pendingBackups.size;
+  return {
+    configured: true,
+    status: pending ? (backupLastErrorAt ? "degraded" : "syncing") : "ready",
+    pending,
+    ...(backupLastSuccessAt ? { lastSuccessAt: backupLastSuccessAt } : {}),
+    ...(backupLastErrorAt ? { lastErrorAt: backupLastErrorAt } : {})
+  };
+}
+
+function scheduleBackupRetry() {
+  if (!r2 || !pendingBackups.size || backupRetryTimer) return;
+  backupRetryTimer = setTimeout(() => {
+    backupRetryTimer = null;
+    void drainBackupQueue();
+  }, r2RetryMs);
+  backupRetryTimer.unref?.();
+}
+
+function enqueuePhotoBackups(records) {
+  if (!r2) return;
+  for (const record of records) pendingBackups.set(record.id, record);
+  void drainBackupQueue();
+}
+
+async function drainBackupQueue() {
+  if (!r2) return;
+  if (backupWorker) return backupWorker;
+
+  const worker = (async () => {
+    for (const [id, record] of pendingBackups) {
+      try {
+        const content = await fs.readFile(path.join(uploadDir, record.storedName));
+        await backupPhoto(record, content);
+        pendingBackups.delete(id);
+        backupLastSuccessAt = new Date().toISOString();
+        console.log(`[backup] copied photo ${id} to R2`);
+      } catch (error) {
+        backupLastErrorAt = new Date().toISOString();
+        console.error(`[backup] photo ${id} remains queued`, error);
+      }
+    }
+  })();
+
+  backupWorker = worker;
+  try {
+    await worker;
+  } finally {
+    if (backupWorker === worker) backupWorker = null;
+    if (pendingBackups.size) scheduleBackupRetry();
+  }
+}
+
 async function readBackupRecord(id) {
   if (!r2) return null;
   try {
@@ -291,25 +356,29 @@ async function backupObjectExists(key) {
 async function backupExistingPhotos() {
   if (!r2) return;
   const entries = Object.entries(await readDb()).filter(([id, photo]) => validPhotoRecord(id, photo));
-  let copied = 0;
+  const missing = [];
 
   for (let index = 0; index < entries.length; index += 3) {
     const group = entries.slice(index, index + 3);
     await Promise.all(group.map(async ([, photo]) => {
-      const photoKey = r2Key("photos", photo.storedName);
-      const recordKey = r2Key("records", `${photo.id}.json`);
-      const [hasPhoto, hasRecord] = await Promise.all([
-        backupObjectExists(photoKey),
-        backupObjectExists(recordKey)
-      ]);
-      if (hasPhoto && hasRecord) return;
-      const content = await fs.readFile(path.join(uploadDir, photo.storedName));
-      await backupPhoto(photo, content);
-      copied += 1;
+      try {
+        const photoKey = r2Key("photos", photo.storedName);
+        const recordKey = r2Key("records", `${photo.id}.json`);
+        const [hasPhoto, hasRecord] = await Promise.all([
+          backupObjectExists(photoKey),
+          backupObjectExists(recordKey)
+        ]);
+        if (!hasPhoto || !hasRecord) missing.push(photo);
+      } catch (error) {
+        backupLastErrorAt = new Date().toISOString();
+        console.error(`[backup] could not inspect photo ${photo.id}; queued for retry`, error);
+        missing.push(photo);
+      }
     }));
   }
 
-  console.log(`[backup] R2 ready; ${entries.length} photo(s) checked, ${copied} copied`);
+  console.log(`[backup] R2 scan finished; ${entries.length} photo(s) checked, ${missing.length} queued`);
+  enqueuePhotoBackups(missing);
 }
 
 function createAccessToken() {
@@ -584,7 +653,6 @@ async function handleUpload(req, res) {
   }
 
   const storedPaths = [];
-  const backedUpRecords = [];
   try {
     const contentType = String(req.headers["content-type"] || "");
     if (!contentType.toLowerCase().startsWith("multipart/form-data")) {
@@ -632,9 +700,6 @@ async function handleUpload(req, res) {
         createdAt: new Date().toISOString()
       });
 
-      await backupPhoto(records.at(-1), file.content);
-      if (r2) backedUpRecords.push(records.at(-1));
-
       created.push({
         id,
         uploadIndex,
@@ -658,10 +723,10 @@ async function handleUpload(req, res) {
       for (const record of records) db[record.id] = record;
     });
 
+    enqueuePhotoBackups(records);
     sendJson(res, 201, { photos: created });
   } catch (error) {
     await Promise.allSettled(storedPaths.map((storedPath) => fs.unlink(storedPath)));
-    await Promise.allSettled(backedUpRecords.map((record) => deleteBackupRecord(record)));
     console.error("[upload]", error);
     const publicError = [413, 507].includes(error.status) ? error.message : "Не удалось загрузить фото.";
     sendJson(res, error.status || 400, { error: publicError });
@@ -770,6 +835,16 @@ const server = createServer(async (req, res) => {
   try {
     const url = new URL(req.url, "http://localhost");
     const method = String(req.method || "GET").toUpperCase();
+
+    if (["GET", "HEAD"].includes(method) && ["/health", "/api/health"].includes(url.pathname)) {
+      sendJson(res, 200, {
+        ok: true,
+        build: appBuild,
+        primaryStorage: "ready",
+        backup: currentBackupStatus()
+      }, method);
+      return;
+    }
 
     if (method === "POST" && url.pathname === "/api/upload") {
       if (rejectCrossSite(req, res)) return;

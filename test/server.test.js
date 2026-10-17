@@ -33,7 +33,13 @@ const child = spawn(process.execPath, ["server.js"], {
     PHOTO_SESSION_SECRET: "test-session-secret-that-is-long-enough-123456",
     ACCESS_RATE_LIMIT: "2",
     ACCESS_RATE_WINDOW_MS: "60000",
-    UPLOAD_RATE_LIMIT: "20"
+    UPLOAD_RATE_LIMIT: "20",
+    R2_BUCKET: "",
+    R2_ENDPOINT: "",
+    R2_ACCESS_KEY_ID: "",
+    R2_SECRET_ACCESS_KEY: "",
+    R2_PREFIX: "",
+    R2_FORCE_PATH_STYLE: ""
   },
   stdio: ["ignore", "pipe", "pipe"]
 });

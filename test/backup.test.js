@@ -102,6 +102,17 @@ test("R2 backup restores the database record and photo while preserving its link
   assert.ok(match);
   const [, id, key] = match;
 
+  const backupReadyAt = Date.now() + 10_000;
+  let backupHealth = null;
+  while (Date.now() < backupReadyAt) {
+    const health = await fetch(`${baseUrl}/api/health`);
+    backupHealth = health.ok ? await health.json() : null;
+    if (backupHealth?.backup?.status === "ready" && backupHealth.backup.pending === 0) break;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  assert.equal(backupHealth?.backup?.status, "ready");
+  assert.equal(backupHealth?.backup?.pending, 0);
+
   const db = JSON.parse(await fs.readFile(path.join(uploadDir, "photos.json"), "utf8"));
   await fs.unlink(path.join(uploadDir, db[id].storedName));
   await fs.unlink(path.join(uploadDir, "photos.json"));
