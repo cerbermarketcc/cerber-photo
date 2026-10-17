@@ -34,6 +34,7 @@ const r2AccessKeyId = String(process.env.R2_ACCESS_KEY_ID || "").trim();
 const r2SecretAccessKey = String(process.env.R2_SECRET_ACCESS_KEY || "").trim();
 const r2Prefix = String(process.env.R2_PREFIX || "cerber-photo").trim().replace(/^\/+|\/+$/g, "");
 const r2RetryMs = positiveNumber(process.env.R2_RETRY_MS, 60 * 1000);
+const primaryStorageCheckTtlMs = 30 * 1000;
 const appBuild = String(process.env.RENDER_GIT_COMMIT || process.env.APP_BUILD || "local").trim().slice(0, 40) || "local";
 const rateBuckets = new Map();
 let dbWriteQueue = Promise.resolve();
@@ -42,6 +43,10 @@ let backupWorker = null;
 let backupRetryTimer = null;
 let backupLastErrorAt = null;
 let backupLastSuccessAt = null;
+let backupInitialCheckComplete = false;
+let primaryStorageCheck = null;
+let primaryStorageCheckResult = null;
+let primaryStorageCheckExpiresAt = 0;
 
 const r2Settings = [r2Bucket, r2Endpoint, r2AccessKeyId, r2SecretAccessKey];
 if (r2Settings.some(Boolean) && !r2Settings.every(Boolean)) {
@@ -153,6 +158,40 @@ async function readDb() {
   }
 }
 
+async function checkPrimaryStorage() {
+  if (primaryStorageCheckResult && Date.now() < primaryStorageCheckExpiresAt) {
+    return primaryStorageCheckResult;
+  }
+  if (primaryStorageCheck) return primaryStorageCheck;
+
+  const check = (async () => {
+    const probePath = path.join(uploadDir, `.health-${process.pid}-${crypto.randomBytes(6).toString("hex")}`);
+    const checkedAt = new Date().toISOString();
+    try {
+      await fs.writeFile(probePath, "ok", { encoding: "utf8", mode: 0o600, flag: "wx" });
+      const probe = await fs.readFile(probePath, "utf8");
+      if (probe !== "ok") throw new Error("Primary storage probe mismatch");
+      await fs.unlink(probePath);
+      await readDb();
+      return { status: "ready", checkedAt };
+    } catch (error) {
+      await fs.unlink(probePath).catch(() => {});
+      console.error(`[health] primary storage check failed (${error?.code || error?.name || "unknown"})`);
+      return { status: "unavailable", checkedAt };
+    }
+  })();
+
+  primaryStorageCheck = check;
+  try {
+    const result = await check;
+    primaryStorageCheckResult = result;
+    primaryStorageCheckExpiresAt = Date.now() + primaryStorageCheckTtlMs;
+    return result;
+  } finally {
+    if (primaryStorageCheck === check) primaryStorageCheck = null;
+  }
+}
+
 async function writePrivateJson(filePath, value) {
   const tmpPath = `${filePath}.${crypto.randomBytes(6).toString("hex")}.tmp`;
   await fs.writeFile(tmpPath, JSON.stringify(value, null, 2), { encoding: "utf8", mode: 0o600 });
@@ -242,7 +281,11 @@ function currentBackupStatus() {
   const pending = pendingBackups.size;
   return {
     configured: true,
-    status: pending ? (backupLastErrorAt ? "degraded" : "syncing") : "ready",
+    status: !backupInitialCheckComplete
+      ? (backupLastErrorAt ? "degraded" : "checking")
+      : pending
+        ? (backupLastErrorAt ? "degraded" : "syncing")
+        : "ready",
     pending,
     ...(backupLastSuccessAt ? { lastSuccessAt: backupLastSuccessAt } : {}),
     ...(backupLastErrorAt ? { lastErrorAt: backupLastErrorAt } : {})
@@ -837,10 +880,13 @@ const server = createServer(async (req, res) => {
     const method = String(req.method || "GET").toUpperCase();
 
     if (["GET", "HEAD"].includes(method) && ["/health", "/api/health"].includes(url.pathname)) {
-      sendJson(res, 200, {
-        ok: true,
+      const primaryStorage = await checkPrimaryStorage();
+      const ok = primaryStorage.status === "ready";
+      sendJson(res, ok ? 200 : 503, {
+        ok,
         build: appBuild,
-        primaryStorage: "ready",
+        primaryStorage: primaryStorage.status,
+        primaryStorageCheckedAt: primaryStorage.checkedAt,
         backup: currentBackupStatus()
       }, method);
       return;
@@ -886,7 +932,11 @@ server.maxHeadersCount = 100;
 server.listen(port, () => {
   console.log(`Cerber Anonim Photo listening on port ${port}`);
   if (r2) {
-    backupExistingPhotos().catch((error) => console.error("[backup] initial R2 sync failed", error));
+    backupExistingPhotos()
+      .catch((error) => console.error("[backup] initial R2 sync failed", error))
+      .finally(() => {
+        backupInitialCheckComplete = true;
+      });
   } else {
     console.warn("[backup] R2 is not configured; photos only exist on the Render disk");
   }

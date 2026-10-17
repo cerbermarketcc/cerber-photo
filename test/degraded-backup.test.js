@@ -153,6 +153,11 @@ test("an unavailable R2 backup does not block uploads or local photo access", as
 
   assert.equal(health.ok, true);
   assert.equal(health.primaryStorage, "ready");
+  assert.match(health.primaryStorageCheckedAt, /^\d{4}-\d{2}-\d{2}T/);
+  const cachedHealthResponse = await fetch(`${baseUrl}/api/health`);
+  assert.equal(cachedHealthResponse.status, 200);
+  const cachedHealth = await cachedHealthResponse.json();
+  assert.equal(cachedHealth.primaryStorageCheckedAt, health.primaryStorageCheckedAt);
   assert.equal(health.backup.configured, true);
   assert.equal(health.backup.status, "degraded");
   assert.equal(health.backup.pending, 1);
